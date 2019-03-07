@@ -5,6 +5,19 @@ include: minimal.yaml
 boot_location: new
 tmp-is-dir: true
 
+initramfs-args:
+  - --no-hostonly
+  # We don't support root on NFS, so we don't need it in the initramfs. It also
+  # conflicts with /var mount support in ignition because NFS tries to mount stuff
+  # in /var/ and then ignition can't cleanly unmount it. For example:
+  # https://github.com/dracutdevs/dracut/blob/1856ae95c873a6fe855b3dccd0144f1a96b9e71c/modules.d/95nfs/nfs-start-rpc.sh#L7
+  # See also discussion in https://github.com/coreos/fedora-coreos-config/pull/60
+  - --omit=nfs
+  # Omit these since we don't use them
+  - --omit=lvm
+  - --omit=multipath
+  - --omit=iscsi
+
 # Required by Ignition, and makes the system not compatible with Anaconda
 machineid-compat: false
 
@@ -13,8 +26,8 @@ automatic_version_prefix: "29"
 repos:
   - fedora
   - fedora-updates
-  - fedora-updates-testing
   - dustymabe-ignition
+  - dustymabe-coreos-installer
 
 ignore-removed-users:
   - root
@@ -41,6 +54,13 @@ postprocess:
     for x in /etc/yum.repos.d/*modular.repo; do
       sed -i -e 's,enabled=[01],enabled=0,' ${x}
     done
+
+    # The grub bits are mainly designed for desktops, and IMO haven't seen
+    # enough testing in concert with ostree. At some point we'll flesh out
+    # the full plan in https://github.com/coreos/fedora-coreos-tracker/issues/47
+    # NOTE: Also remove 01_fallback_counting once we move to f30
+    rm -v /etc/grub.d/01_menu_auto_hide
+    rm -v /usr/lib/systemd/user/grub-boot-success*
 
     # See machineid-compat in host-base.yaml.
     # Since that makes presets run on boot, we need to have our defaults in /usr
@@ -94,7 +114,22 @@ postprocess:
     ConditionPathExists=!/var/lib/coreos-growpart.stamp
     Before=sshd.service
     [Service]
+    Type=oneshot
     ExecStart=/usr/libexec/coreos-growpart /
+    RemainAfterExit=yes
+    [Install]
+    WantedBy=multi-user.target
+    EOF
+
+    # See https://github.com/coreos/ignition/issues/600
+    # which originated from https://github.com/coreos/coreos-metadata/pull/90#discussion_r202438581
+    cat > /usr/lib/systemd/system/coreos-useradd-core.service <<'EOF'
+    [Unit]
+    ConditionFirstBoot=true
+    Before=sshd.service
+    [Service]
+    Type=oneshot
+    ExecStart=/usr/bin/sh -c 'if !getent passwd core &>/dev/null; then /usr/sbin/useradd -G wheel,sudo,adm,systemd-journal core; fi'
     RemainAfterExit=yes
     [Install]
     WantedBy=multi-user.target
@@ -102,9 +137,12 @@ postprocess:
 
     cat >/usr/lib/systemd/system-preset/42-coreos.preset << EOF
     # Presets here that eventually should live in the generic fedora presets
-    # This one is from https://github.com/dustymabe/ignition-dracut
-    enable coreos-firstboot-complete.service
+    # This one is from https://github.com/coreos/ignition-dracut
+    enable ignition-firstboot-complete.service
     enable coreos-growpart.service
+    enable coreos-useradd-core.service
+    enable console-login-helper-messages-*.service
+    enable console-login-helper-messages-*.path
     EOF
 
     # Let's have a non-boring motd, just like CL (although theirs is more subdued
@@ -122,6 +160,31 @@ postprocess:
     # And mark as preview in the os-release too, this then shows up in eg. GRUB2
     sed -i -e 's/CoreOS/CoreOS preview/' $(realpath /etc/os-release)
 
+    # For now we are using kmsg [1] for multiplexing output to
+    # multiple console devices during early boot. We need to also tell 
+    # the kernel not to ratelimit kmsg during the initramfs.
+    # 
+    # We do not want to use kmsg in the future as there may be sensitive
+    # ignition data that leaks to non-root users (by reading the kernel
+    # ring buffer using `dmesg`). In the future we will rely on kernel
+    # console multiplexing [2] for this and will not use kmsg.
+    # 
+    # [1] https://github.com/coreos/ignition-dracut/blob/26f2396b116286dcb46644dc157e4211aea3aba5/dracut/99journald-conf/00-journal-log-forwarding.conf#L2
+    # [2] https://github.com/coreos/fedora-coreos-tracker/issues/136
+    mkdir -p /usr/lib/dracut/modules.d/10coreos-sysctl
+    cat << 'EOF' > /usr/lib/dracut/modules.d/10coreos-sysctl/module-setup.sh
+    #!/usr/bin/bash
+    check() { return 0; } # include by default
+    install() {
+        mkdir -p "$initdir/etc/sysctl.d"
+        echo "kernel.printk_devkmsg = on" > "$initdir/etc/sysctl.d/10-dont-ratelimit-kmsg.conf"
+    }
+    EOF
+    # After initramfs (in booted system), switch back to ratelimit
+    cat << 'EOF' > /usr/lib/sysctl.d/10-coreos-ratelimit-kmsg.conf
+    kernel.printk_devkmsg = ratelimit
+    EOF
+
 packages:
   # SELinux
   - selinux-policy-targeted policycoreutils-python
@@ -135,8 +198,10 @@ packages:
   # Containers
   - podman skopeo runc moby-engine
   # Networking
-  - bridge-utils nfs-utils biosdevname iptables-services
+  - bridge-utils nfs-utils
   - NetworkManager dnsmasq hostname
+  # Static firewalling
+  - iptables nftables iptables-nft iptables-services
   # Storage
   - cloud-utils-growpart
   - lvm2 iscsi-initiator-utils sg3_utils
@@ -149,8 +214,16 @@ packages:
   - authconfig sssd shadow-utils
   - logrotate
   # Used by admins interactively
-  - sudo coreutils less tar xz gzip bzip2 tmux
+  - sudo coreutils less tar xz gzip bzip2
   - nmap-ncat net-tools bind-utils
   - bash-completion
-  # Moving files around
+  # Moving files around and verifying them
   - rsync fuse-sshfs
+  - gnupg2
+  # User experience
+  - console-login-helper-messages
+  - console-login-helper-messages-motdgen
+  - console-login-helper-messages-issuegen
+  - console-login-helper-messages-profile
+  # CoreOS Installer
+  - coreos-installer coreos-installer-dracut
